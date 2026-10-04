@@ -1,0 +1,6 @@
+*
+!Scenario1/mcp_servers/requirements.txt
+!Scenario1/mcp_servers/backends.py
+!Scenario1/mcp_servers/server.py
+!Scenario1/mcp_servers/sql_guard.py
+!Scenario3/docker/constraints.txt

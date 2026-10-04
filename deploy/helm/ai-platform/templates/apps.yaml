@@ -1,0 +1,159 @@
+{{- /* Every long-running component: Deployment + Service (+ SecretProviderClass, HPA, PDB). */}}
+{{- range $name, $c := .Values.apps }}
+{{- $identity := $c.identity | default "" }}
+{{- $uid := $c.runAsUser | default 10001 }}
+{{- $health := $c.health | default "/healthz" }}
+{{- $replicas := $c.replicas | default 2 | int }}
+{{- if $c.secrets }}
+{{ include "ai.secretProviderClass" (list $ $name $identity $c.secrets) }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ai.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  {{- if not $c.maxReplicas }}
+  replicas: {{ $replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels:
+        {{- include "ai.podLabels" (list $ $name $identity) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ai.serviceAccountName" $identity }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "ai.podSecurityContext" $uid | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $name }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "ai.image" (list $ $name $c) }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- with $c.args }}
+          args:
+            {{- range . }}
+            - {{ tpl (toString .) $ | quote }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $c.port }}
+          env:
+            - name: HOME
+              value: /tmp
+            {{- include "ai.env" (list $ $c.env) | indent 12 }}
+            {{- include "ai.secretEnv" (list $name $c.secrets) | indent 12 }}
+          startupProbe:
+            httpGet: { path: {{ $health }}, port: http }
+            periodSeconds: 5
+            failureThreshold: {{ div ($c.startupSeconds | default 60) 5 }}
+          readinessProbe:
+            httpGet: { path: {{ $health }}, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: {{ $health }}, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml ($c.resources | default $.Values.defaults.resources) | nindent 12 }}
+          securityContext:
+            {{- include "ai.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- if $c.secrets }}
+            - { name: kv, mountPath: /mnt/secrets-store, readOnly: true }
+            {{- end }}
+            {{- if $c.mountTlsCertificate }}
+            - { name: ingress-tls, mountPath: /mnt/ingress-tls, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+        {{- if $c.secrets }}
+        - name: kv
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ $name }}-kv
+        {{- end }}
+        {{- if $c.mountTlsCertificate }}
+        # Mounting this volume is what keeps the "ingress-tls" Secret synced from Key Vault.
+        - name: ingress-tls
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ingress-tls
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ai.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+{{- if gt $replicas 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ai.labels" $ | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+---
+{{- end }}
+{{- if $c.maxReplicas }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ai.labels" $ | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $name }}
+  minReplicas: {{ $replicas }}
+  maxReplicas: {{ $c.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+---
+{{- end }}
+{{- end }}

@@ -1,0 +1,6 @@
+*
+!Scenario2/api/requirements.txt
+!Scenario2/api/app
+!Scenario2/common
+**/__pycache__
+**/.env

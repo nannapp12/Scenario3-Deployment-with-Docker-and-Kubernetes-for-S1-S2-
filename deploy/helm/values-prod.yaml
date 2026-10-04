@@ -1,0 +1,59 @@
+# Production values. Non-secret settings only: every secret stays in Key Vault and reaches
+# pods through the Secrets Store CSI driver. Fill in the <...> placeholders from the
+# Scenario 1 / Scenario 2 / Scenario 3 deployment outputs (see Scenario3/README.md).
+# image.registry and image.tag are passed by the CI/CD pipeline.
+
+host: <ai.contoso.com>
+
+azure:
+  tenantId: <tenant-id>
+  identities:
+    orders:
+      clientId: <client id of ordersva-id>
+      keyVaultName: <ordersva keyVaultName output>
+    pto:
+      clientId: <client id of ptorag-id>
+      keyVaultName: <ptorag keyVaultName output>
+    pto-pipelines:
+      clientId: <client id of ptorag-pipelines-id>
+      keyVaultName: <ptorag keyVaultName output>
+
+auth:
+  clientId: <Scenario 2 entraAuthClientId>
+
+apps:
+  orders-api:
+    env:
+      FOUNDRY_PROJECT_ENDPOINT: https://<foundry-resource>.services.ai.azure.com/api/projects/<project>
+      SPEECH_REGION: eastus
+  pto-api:
+    env:
+      PG_HOST: <ptorag pgHost output>
+      AZURE_OPENAI_ENDPOINT: https://<foundry-resource>.openai.azure.com
+  mcp-databricks:
+    env:
+      DATABRICKS_HOST: <adb-xxxx.azuredatabricks.net>
+      DATABRICKS_HTTP_PATH: </sql/1.0/warehouses/xxxx>
+  mcp-mysql:
+    env:
+      MYSQL_HOST: <ordersva mysqlHost output>
+  mcp-snowflake:
+    env:
+      SNOWFLAKE_ACCOUNT: <orgname-accountname>
+
+cronJobs:
+  mysql-loader:
+    env:
+      MYSQL_HOST: <ordersva mysqlHost output>
+      STORAGE_ACCOUNT: <ordersva storageAccount output>
+  employee-sync:
+    env:
+      PG_HOST: <ptorag pgHost output>
+      DATABRICKS_AWS_HOST: <dbc-xxxx.cloud.databricks.com>
+      DATABRICKS_AWS_HTTP_PATH: </sql/1.0/warehouses/xxxx>
+      DATABRICKS_AWS_CLIENT_ID: <service principal application id>
+  handbook-ingest:
+    env:
+      PG_HOST: <ptorag pgHost output>
+      STORAGE_ACCOUNT: <ptorag storageAccount output>
+      AZURE_OPENAI_ENDPOINT: https://<foundry-resource>.openai.azure.com

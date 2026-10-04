@@ -1,0 +1,13 @@
+{
+  "issuerParameters": { "name": "Self" },
+  "keyProperties": { "exportable": true, "keyType": "RSA", "keySize": 2048, "reuseKey": false },
+  "secretProperties": { "contentType": "application/x-pem-file" },
+  "x509CertificateProperties": {
+    "subject": "CN=ai.contoso.com",
+    "subjectAlternativeNames": { "dnsNames": [ "ai.contoso.com", "*.ai.contoso.com" ] },
+    "keyUsage": [ "digitalSignature", "keyEncipherment" ],
+    "ekus": [ "1.3.6.1.5.5.7.3.1" ],
+    "validityInMonths": 12
+  },
+  "lifetimeActions": [ { "trigger": { "daysBeforeExpiry": 30 }, "action": { "actionType": "AutoRenew" } } ]
+}

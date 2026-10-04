@@ -1,0 +1,45 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $exposed := list }}
+{{- range .Values.ingress.paths }}{{ $exposed = append $exposed .app }}{{ end }}
+{{- $exposed = concat $exposed .Values.ingress.mcpApps | uniq }}
+# Nothing reaches a pod unless a policy below allows it. CronJob pods accept no traffic.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  labels:
+    {{- include "ai.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+{{- range $name, $c := .Values.apps }}
+{{- $fromIngress := has $name $exposed }}
+{{- if or $fromIngress $c.allowFrom }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-to-{{ $name }}
+  labels:
+    {{- include "ai.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: {{ $c.port }}
+      from:
+        {{- if $fromIngress }}
+        {{- toYaml $.Values.networkPolicy.ingressControllerPeers | nindent 8 }}
+        {{- end }}
+        {{- range $c.allowFrom }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ . }}
+        {{- end }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

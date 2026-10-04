@@ -1,0 +1,10 @@
+# Upper bounds for packages whose next major version breaks Scenario 1/2 code.
+# The scenarios' requirements.txt files only set lower bounds; every image installs with
+# PIP_CONSTRAINT pointing here. Drop a line once that code is ported.
+
+# Scenario1/mcp_servers: mcp 2.x renamed FastMCP to MCPServer (mcp.server.fastmcp is gone).
+mcp<2
+# Scenario1/api/app/agent.py: azure-ai-projects 2.x dropped the azure-ai-agents
+# threads/runs API (project_client.agents.threads / runs / list_agents).
+azure-ai-projects<2
+azure-ai-agents<2

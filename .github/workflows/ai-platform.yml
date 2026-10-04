@@ -1,0 +1,189 @@
+# Build -> test -> push images -> deploy to AKS, on every change to Scenarios 1, 2 or 3.
+#
+# GitHub only runs workflows from <repo root>/.github/workflows. This file assumes the
+# repository root is the folder containing Scenario1/, Scenario2/ and Scenario3/; copy it to
+# <repo root>/.github/workflows/ai-platform.yml (see Scenario3/README.md, "CI/CD").
+#
+# Azure access uses OpenID Connect (no stored credentials). Repository variables:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID   CI/CD app registration
+#   ACR_NAME                                                  Scenario 1 registry name
+#   AKS_RESOURCE_GROUP, AKS_CLUSTER_NAME                      Scenario 3 cluster
+#   APP_HOST                                                  public host, e.g. ai.contoso.com
+name: ai-platform
+
+on:
+  push:
+    branches: [main]
+    paths: [Scenario1/**, Scenario2/**, Scenario3/**, .github/workflows/ai-platform.yml]
+  pull_request:
+    paths: [Scenario1/**, Scenario2/**, Scenario3/**, .github/workflows/ai-platform.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NAMESPACE: ai-platform
+  CHART: Scenario3/deploy/helm/ai-platform
+  VALUES: Scenario3/deploy/helm/values-prod.yaml
+  PIP_CONSTRAINT: ${{ github.workspace }}/Scenario3/docker/constraints.txt
+
+jobs:
+  # ------------------------------------------------------------------ test
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Scenario 1 - MCP SQL guard tests
+        working-directory: Scenario1/mcp_servers
+        run: |
+          pip install -r requirements.txt pytest
+          pytest -q
+
+      - name: Scenario 1 - Orders API imports against the pinned SDKs
+        working-directory: Scenario1/api
+        env:
+          FOUNDRY_PROJECT_ENDPOINT: https://example.services.ai.azure.com/api/projects/ci
+          MCP_DATABRICKS_URL: https://example/mcp
+          MCP_MYSQL_URL: https://example/mcp
+          MCP_SNOWFLAKE_URL: https://example/mcp
+          MCP_API_KEY: ci
+          SPEECH_REGION: eastus
+          SPEECH_KEY: ci
+        run: |
+          pip install -r requirements.txt
+          python -c "import app.main, app.agent"
+
+      - name: Scenario 2 - API and pipeline tests
+        working-directory: Scenario2
+        run: |
+          pip install -r api/requirements.txt -r pipelines/postgres/requirements.txt pytest httpx
+          pytest -q api/tests pipelines/postgres/test_pipelines.py
+
+      - name: Helm lint and render
+        run: |
+          helm lint "$CHART" -f "$VALUES" --set image.registry=ci.azurecr.io
+          helm template ai-platform "$CHART" -n "$NAMESPACE" -f "$VALUES" \
+            --set image.registry=ci.azurecr.io --set image.tag=ci > rendered.yaml
+
+      - name: Validate Kubernetes manifests
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          # SecretProviderClass is a CRD without a published schema here; everything else is checked.
+          ./kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.31.0 rendered.yaml
+
+      - name: Bicep build
+        run: az bicep build --file Scenario3/infra/aks.bicep --stdout > /dev/null
+
+  # ------------------------------------------------------------------ build + push
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { image: web,             dockerfile: Scenario3/docker/web/Dockerfile }
+          - { image: orders-api,      dockerfile: Scenario3/docker/orders-api/Dockerfile }
+          - { image: pto-api,         dockerfile: Scenario3/docker/pto-api/Dockerfile }
+          - { image: mcp-databricks,  dockerfile: Scenario3/docker/mcp/Dockerfile,          args: MCP_BACKEND=databricks }
+          - { image: mcp-mysql,       dockerfile: Scenario3/docker/mcp/Dockerfile,          args: MCP_BACKEND=mysql }
+          - { image: mcp-snowflake,   dockerfile: Scenario3/docker/mcp/Dockerfile,          args: MCP_BACKEND=snowflake }
+          - { image: mysql-loader,    dockerfile: Scenario3/docker/mysql-loader/Dockerfile }
+          - { image: employee-sync,   dockerfile: Scenario3/docker/pto-pipeline/Dockerfile, args: PIPELINE=sync_employees.py }
+          - { image: handbook-ingest, dockerfile: Scenario3/docker/pto-pipeline/Dockerfile, args: PIPELINE=ingest_handbook.py }
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Azure login (OIDC)
+        if: env.PUSH == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        if: env.PUSH == 'true'
+        run: az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Build${{ env.PUSH == 'true' && ' and push' || '' }} ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: ${{ matrix.args }}
+          push: ${{ env.PUSH == 'true' }}
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ vars.ACR_NAME || 'local' }}.azurecr.io/${{ matrix.image }}:${{ github.sha }}
+            ${{ vars.ACR_NAME || 'local' }}.azurecr.io/${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # ------------------------------------------------------------------ deploy
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: aks-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/setup-helm@v4
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: v0.1.6
+
+      - name: AKS credentials (Entra ID)
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+          use-kubelogin: "true"
+
+      - name: Helm upgrade (rolls back automatically on failure)
+        run: |
+          helm upgrade --install ai-platform "$CHART" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES" \
+            --set image.registry="${{ vars.ACR_NAME }}.azurecr.io" \
+            --set image.tag="${{ github.sha }}" \
+            --atomic --wait --timeout 10m
+
+      - name: Smoke test
+        run: |
+          kubectl -n "$NAMESPACE" get deploy,cronjob,ingress
+          for path in /healthz /hr/ ; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ vars.APP_HOST }}$path")
+            echo "$path -> $code"
+          done
+          curl -fsS "https://${{ vars.APP_HOST }}/healthz"

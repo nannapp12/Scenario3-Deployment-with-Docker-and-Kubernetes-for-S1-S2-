@@ -1,0 +1,248 @@
+# Defaults for the ai-platform chart. Environment-specific values live in ../values-prod.yaml.
+# Env values and args are rendered with `tpl`, so they may reference other values
+# (e.g. "https://{{ .Values.host }}").
+
+image:
+  registry: ""                 # <acr>.azurecr.io (CI passes --set image.registry=...)
+  tag: latest                  # CI passes the git SHA
+  pullPolicy: IfNotPresent
+
+# Public DNS name of the website and both APIs. Each MCP server gets its own name,
+# <app>.<host> (e.g. mcp-mysql.ai.contoso.com), because Foundry calls them at "/mcp".
+host: ""
+
+ingress:
+  # AKS application routing add-on (managed NGINX). The Ingress below only uses the
+  # standard API; the annotations are NGINX tuning that other controllers ignore.
+  className: webapprouting.kubernetes.azure.com
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"   # agent runs take up to 120 s
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"    # Entra ID session cookies
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+  tls:
+    # Key Vault certificate (in the identity's vault below) whose SANs cover host and *.host.
+    # The Secrets Store CSI driver syncs it into the Kubernetes TLS Secret "ingress-tls".
+    keyVaultCertificateName: ai-platform-tls
+    identity: orders
+  paths:                        # path prefix -> app (on `host`)
+    - { path: /, app: web }
+    - { path: /api, app: orders-api }
+    - { path: /pto, app: oauth2-proxy }
+    - { path: /hr, app: oauth2-proxy }
+    - { path: /oauth2, app: oauth2-proxy }
+    - { path: /.auth, app: web }
+  mcpApps: [mcp-databricks, mcp-mysql, mcp-snowflake]   # served at https://<app>.<host>/mcp
+
+azure:
+  tenantId: ""
+  # Workload identities (existing user-assigned managed identities from Scenarios 1 and 2).
+  # Each gets a federated credential for the ServiceAccount "<key>-sa" (see infra/aks.bicep).
+  identities:
+    orders:                     # ordersva-id (Scenario 1)
+      clientId: ""
+      keyVaultName: ""          # ordersva-kv-xxxxxx
+    pto:                        # ptorag-id (Scenario 2 API, read-only Postgres role)
+      clientId: ""
+      keyVaultName: ""          # ptorag-kv-xxxxxx
+    pto-pipelines:              # ptorag-pipelines-id (Scenario 2 pipelines, writer role)
+      clientId: ""
+      keyVaultName: ""          # ptorag-kv-xxxxxx
+
+# Entra ID sign-in for the PTO page and API (oauth2-proxy). Reuses Scenario 2's app
+# registration; add https://<host>/oauth2/callback as a Web redirect URI.
+auth:
+  clientId: ""
+  requiredRole: PTO.Read
+
+networkPolicy:
+  enabled: true
+  # Where Ingress traffic comes from. App routing runs NGINX in app-routing-system.
+  ingressControllerPeers:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: app-routing-system
+
+defaults:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+# ---------------------------------------------------------------- Deployments
+# image: defaults to <registry>/<app name>:<tag>.  secrets: ENV_VAR -> Key Vault secret name,
+# read from the identity's vault through a SecretProviderClass.  allowFrom: apps that may
+# call this one inside the cluster (apps listed under ingress also accept Ingress traffic).
+apps:
+  web:
+    identity: orders            # only to mount (and keep syncing) the ingress TLS certificate
+    mountTlsCertificate: true
+    port: 8080
+    runAsUser: 101              # nginx-unprivileged
+    replicas: 2
+    maxReplicas: 4
+    allowFrom: [oauth2-proxy]   # /hr/ is served through oauth2-proxy
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+  orders-api:
+    identity: orders
+    port: 8000
+    replicas: 2
+    maxReplicas: 6
+    startupSeconds: 180         # creates/updates the Foundry agent on startup
+    env:
+      FOUNDRY_PROJECT_ENDPOINT: ""
+      FOUNDRY_MODEL_DEPLOYMENT: gpt-4.1
+      MCP_DATABRICKS_URL: "https://mcp-databricks.{{ .Values.host }}/mcp"
+      MCP_MYSQL_URL: "https://mcp-mysql.{{ .Values.host }}/mcp"
+      MCP_SNOWFLAKE_URL: "https://mcp-snowflake.{{ .Values.host }}/mcp"
+      SPEECH_REGION: eastus
+    secrets:
+      MCP_API_KEY: mcp-api-key
+      SPEECH_KEY: speech-key
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { memory: 1Gi }
+
+  pto-api:
+    identity: pto
+    port: 8000
+    replicas: 2
+    maxReplicas: 5
+    allowFrom: [oauth2-proxy]   # never directly from the Ingress
+    env:
+      PG_HOST: ""
+      PG_DATABASE: hr_rag
+      PG_SSLMODE: verify-full
+      PG_USER: ptorag-id        # Entra principal name in PostgreSQL (roles.sql)
+      AZURE_OPENAI_ENDPOINT: ""
+      CHAT_DEPLOYMENT: gpt-4.1
+      EMBEDDING_DEPLOYMENT: text-embedding-3-small
+      COMPANY_TIMEZONE: UTC
+      PTO_AUTH_MODE: proxy
+      PTO_REQUIRED_ROLE: "{{ .Values.auth.requiredRole }}"
+    secrets:
+      PII_ENCRYPTION_KEY: pii-encryption-key
+
+  mcp-databricks:
+    identity: orders
+    port: 8080
+    replicas: 2
+    maxReplicas: 5
+    env:
+      DATABRICKS_HOST: ""
+      DATABRICKS_HTTP_PATH: ""
+    secrets:
+      DATABRICKS_TOKEN: databricks-token
+      MCP_API_KEY: mcp-api-key
+
+  mcp-mysql:
+    identity: orders
+    port: 8080
+    replicas: 2
+    maxReplicas: 5
+    env:
+      MYSQL_HOST: ""
+      MYSQL_USER: mcp_reader
+      MYSQL_DATABASE: orders_db
+    secrets:
+      MYSQL_PASSWORD: mysql-reader-password
+      MCP_API_KEY: mcp-api-key
+
+  mcp-snowflake:
+    identity: orders
+    port: 8080
+    replicas: 2
+    maxReplicas: 5
+    env:
+      SNOWFLAKE_ACCOUNT: ""
+      SNOWFLAKE_USER: MCP_ORDERS_READER
+    secrets:
+      SNOWFLAKE_PRIVATE_KEY: snowflake-private-key
+      MCP_API_KEY: mcp-api-key
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.12.0
+    identity: pto               # reads its client and cookie secrets from the PTO vault
+    port: 4180
+    health: /ping
+    runAsUser: 65532
+    replicas: 2
+    args:
+      - --provider=oidc
+      - --oidc-issuer-url=https://login.microsoftonline.com/{{ .Values.azure.tenantId }}/v2.0
+      - --client-id={{ .Values.auth.clientId }}
+      - --redirect-url=https://{{ .Values.host }}/oauth2/callback
+      - --whitelist-domain={{ .Values.host }}
+      - --cookie-domain={{ .Values.host }}
+      - --http-address=0.0.0.0:4180
+      - --reverse-proxy=true
+      - --upstream=http://pto-api.{{ .Release.Namespace }}.svc.cluster.local/pto/
+      - --upstream=http://web.{{ .Release.Namespace }}.svc.cluster.local/hr/
+      - --scope=openid profile email
+      - --oidc-groups-claim=roles               # Entra app roles are checked as "groups"
+      - --allowed-group={{ .Values.auth.requiredRole }}
+      - --oidc-email-claim=preferred_username
+      - --insecure-oidc-allow-unverified-email=true   # Entra ID sends no email_verified claim
+      - --email-domain=*
+      - --pass-user-headers=true                # X-Forwarded-User/-Groups to the PTO API
+      - --cookie-secure=true
+      - --cookie-samesite=lax
+      - --cookie-expire=8h
+      - --skip-provider-button=true
+      - --silence-ping-logging=true
+    secrets:
+      OAUTH2_PROXY_CLIENT_SECRET: entra-auth-client-secret
+      OAUTH2_PROXY_COOKIE_SECRET: oauth2-proxy-cookie-secret
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+# ---------------------------------------------------------------- CronJobs (pipelines)
+cronJobs:
+  mysql-loader:                 # Scenario 1: landing/mysql/*.csv -> orders_db.orders
+    identity: orders
+    schedule: "30 * * * *"
+    activeDeadlineSeconds: 1800
+    backoffLimit: 2
+    env:
+      MYSQL_HOST: ""
+      MYSQL_USER: orders_loader
+      STORAGE_ACCOUNT: ""
+    secrets:
+      MYSQL_PASSWORD: mysql-loader-password
+
+  employee-sync:                # Scenario 2: Databricks on AWS -> hr.employees
+    identity: pto-pipelines
+    schedule: "15 * * * *"
+    activeDeadlineSeconds: 1800
+    backoffLimit: 2
+    env:
+      PG_HOST: ""
+      PG_DATABASE: hr_rag
+      PG_SSLMODE: verify-full
+      PG_USER: ptorag-pipelines-id
+      DATABRICKS_AWS_HOST: ""
+      DATABRICKS_AWS_HTTP_PATH: ""
+      DATABRICKS_AWS_CLIENT_ID: ""
+    secrets:
+      PII_ENCRYPTION_KEY: pii-encryption-key
+      DATABRICKS_AWS_CLIENT_SECRET: databricks-aws-client-secret
+
+  handbook-ingest:              # Scenario 2: handbook -> chunks -> embeddings -> pgvector
+    identity: pto-pipelines
+    schedule: "0 2 * * *"       # idempotent (unchanged documents are skipped); also run on demand
+    activeDeadlineSeconds: 1800
+    backoffLimit: 1
+    args: [--blob-prefix, handbook/]
+    env:
+      PG_HOST: ""
+      PG_DATABASE: hr_rag
+      PG_SSLMODE: verify-full
+      PG_USER: ptorag-pipelines-id
+      STORAGE_ACCOUNT: ""
+      AZURE_OPENAI_ENDPOINT: ""
+      EMBEDDING_DEPLOYMENT: text-embedding-3-small

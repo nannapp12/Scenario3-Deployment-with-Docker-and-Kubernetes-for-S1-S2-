@@ -1,0 +1,76 @@
+{{- $host := required "host is required" .Values.host }}
+{{- $tls := .Values.ingress.tls }}
+{{- $id := include "ai.identity" (list . $tls.identity) | fromYaml }}
+# TLS certificate from Key Vault -> Kubernetes Secret "ingress-tls" (type kubernetes.io/tls).
+# A Key Vault certificate fetched as objectType "secret" contains the private key and the
+# full chain; the CSI driver splits it into tls.key / tls.crt and re-syncs on rotation.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: ingress-tls
+  labels:
+    {{- include "ai.labels" . | nindent 4 }}
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: {{ required "TLS identity clientId is required" $id.clientId | quote }}
+    keyvaultName: {{ required "TLS identity keyVaultName is required" $id.keyVaultName | quote }}
+    tenantId: {{ required "azure.tenantId is required" .Values.azure.tenantId | quote }}
+    objects: |
+      array:
+        - |
+          objectName: {{ $tls.keyVaultCertificateName }}
+          objectType: secret
+  secretObjects:
+    - secretName: ingress-tls
+      type: kubernetes.io/tls
+      data:
+        - objectName: {{ $tls.keyVaultCertificateName }}
+          key: tls.key
+        - objectName: {{ $tls.keyVaultCertificateName }}
+          key: tls.crt
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform
+  labels:
+    {{- include "ai.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - secretName: ingress-tls
+      hosts:
+        - {{ $host | quote }}
+        {{- range .Values.ingress.mcpApps }}
+        - {{ printf "%s.%s" . $host | quote }}
+        {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range .Values.ingress.paths }}
+          - path: {{ .path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .app }}
+                port: { name: http }
+          {{- end }}
+    {{- range .Values.ingress.mcpApps }}
+    # Remote MCP server called by Foundry Agent Service (x-api-key checked by the server).
+    - host: {{ printf "%s.%s" . $host | quote }}
+      http:
+        paths:
+          - path: /mcp
+            pathType: Exact
+            backend:
+              service:
+                name: {{ . }}
+                port: { name: http }
+    {{- end }}

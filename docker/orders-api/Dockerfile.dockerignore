@@ -1,0 +1,6 @@
+*
+!Scenario1/api/requirements.txt
+!Scenario1/api/app
+!Scenario3/docker/constraints.txt
+**/__pycache__
+**/.env

@@ -1,0 +1,7 @@
+*
+!Scenario2/pipelines/postgres/requirements.txt
+!Scenario2/pipelines/postgres/*.py
+!Scenario2/common
+Scenario2/pipelines/postgres/test_*.py
+**/__pycache__
+**/.env

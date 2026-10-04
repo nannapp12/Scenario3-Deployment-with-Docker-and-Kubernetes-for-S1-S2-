@@ -1,0 +1,75 @@
+{{- /* Pipeline jobs. Run one now with:
+       kubectl create job --from=cronjob/<name> <name>-manual -n <namespace> */}}
+{{- range $name, $c := .Values.cronJobs }}
+{{- $identity := $c.identity | default "" }}
+{{- if $c.secrets }}
+{{ include "ai.secretProviderClass" (list $ $name $identity $c.secrets) }}
+---
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ai.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  schedule: {{ $c.schedule | quote }}
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid           # a run never overlaps the previous one
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  suspend: {{ $c.suspend | default false }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $c.backoffLimit | default 1 }}
+      activeDeadlineSeconds: {{ $c.activeDeadlineSeconds | default 1800 }}
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "ai.podLabels" (list $ $name $identity) | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "ai.serviceAccountName" $identity }}
+          automountServiceAccountToken: false
+          securityContext:
+            {{- include "ai.podSecurityContext" ($c.runAsUser | default 10001) | nindent 12 }}
+          containers:
+            - name: {{ $name }}
+              image: {{ include "ai.image" (list $ $name $c) }}
+              imagePullPolicy: {{ $.Values.image.pullPolicy }}
+              {{- with $c.args }}
+              args:
+                {{- range . }}
+                - {{ tpl (toString .) $ | quote }}
+                {{- end }}
+              {{- end }}
+              env:
+                - name: HOME
+                  value: /tmp
+                {{- include "ai.env" (list $ $c.env) | indent 16 }}
+                {{- include "ai.secretEnv" (list $name $c.secrets) | indent 16 }}
+              resources:
+                {{- toYaml ($c.resources | default (dict "requests" (dict "cpu" "250m" "memory" "512Mi") "limits" (dict "memory" "1Gi"))) | nindent 16 }}
+              securityContext:
+                {{- include "ai.containerSecurityContext" . | nindent 16 }}
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+                {{- if $c.secrets }}
+                - { name: kv, mountPath: /mnt/secrets-store, readOnly: true }
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: { sizeLimit: 1Gi }
+            {{- if $c.secrets }}
+            - name: kv
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: {{ $name }}-kv
+            {{- end }}
+---
+{{- end }}
